@@ -1,0 +1,19 @@
+{
+  "data_type": "SYNTHETIC_DEMO",
+  "warning": "This is synthetic data generated for demonstration purposes. It is NOT real retail data.",
+  "seed": 42,
+  "n_stores": 2,
+  "n_products": 3,
+  "n_days": 100,
+  "date_range": "2015-09-23 to 2015-12-31",
+  "total_rows": 600,
+  "signal_components": [
+    "weekly_seasonality",
+    "annual_seasonality",
+    "linear_trend",
+    "promotion_lift",
+    "holiday_effect",
+    "lognormal_noise",
+    "sparse_zero_demand"
+  ]
+}
