@@ -54,9 +54,6 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Streamlit
-.streamlit/secrets.toml
-
 # Pytest
 .pytest_cache/
 .coverage

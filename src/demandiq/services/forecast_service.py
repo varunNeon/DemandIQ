@@ -4,7 +4,7 @@ Forecast service for DemandIQ.
 Orchestrates: data retrieval → model training → backtesting
              → future forecast generation → database storage.
 
-Separates all business logic from the Streamlit UI layer.
+Keeps forecasting logic independent of the web interface and API layer.
 """
 
 from __future__ import annotations

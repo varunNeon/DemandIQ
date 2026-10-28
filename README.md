@@ -1,15 +1,15 @@
 # DemandIQ
 
-DemandIQ is a demand forecasting and inventory planning workspace. Its existing Streamlit interface and forecasting engine remain available while a new Next.js interface is added incrementally.
+DemandIQ is a demand forecasting and inventory planning platform with a Next.js frontend, a FastAPI backend, and PostgreSQL for hosted deployments. Forecasting and inventory business logic lives in Python and is independent of the web interface.
 
 ## Current architecture
 
-- **Forecasting and data:** Python modules under `src/demandiq/`.
-- **Database:** SQLite by default (`demandiq.db` in the project root). SQLAlchemy also supports PostgreSQL through `DATABASE_URL`.
-- **Current interface:** Streamlit, launched with `python -m streamlit run src/demandiq/app/main.py`.
-- **New interface:** Next.js under `web/`, using the read-only FastAPI endpoints under `/api/v1`.
+- **Frontend:** Next.js under `web/`.
+- **API:** FastAPI under `src/demandiq/api/`, served by Uvicorn.
+- **Forecasting and inventory logic:** Python modules under `src/demandiq/`.
+- **Database:** PostgreSQL for deployment, configured with `DATABASE_URL`. SQLite remains available for local development and tests.
 
-The frontend currently provides an overview, demand history with the latest saved forecast, recent model runs and basic workspace health. Forecast generation and inventory controls remain in the Streamlit app while those workflows are migrated.
+The Next.js frontend currently provides an overview, demand history, saved forecast runs, and saved inventory recommendations through the `/api/v1` read endpoints. Forecast generation and recommendation creation are available through the Python pipeline; interactive controls for those actions still need to be added to the Next.js/API stack.
 
 ## Run locally
 
@@ -17,6 +17,14 @@ Install Python dependencies from the project root:
 
 ```powershell
 python -m pip install -e .
+```
+
+For local development, SQLite is used by default. To use PostgreSQL locally or in deployment, set `DATABASE_URL` to your PostgreSQL connection string before starting the API.
+
+Load the demo data into the configured database (omit `--generate-demo` if the CSV demo files are already present):
+
+```powershell
+python scripts/run_pipeline.py --generate-demo --ingest
 ```
 
 Start the API in one terminal:
@@ -35,13 +43,7 @@ npm run dev
 
 Open <http://localhost:3000>. The API docs are at <http://localhost:8000/docs>.
 
-To run the existing Streamlit app instead:
-
-```powershell
-python -m streamlit run src/demandiq/app/main.py
-```
-
-To use a different API URL in the frontend, set `NEXT_PUBLIC_DEMANDIQ_API_URL` in `web/.env.local`. Allowed browser origins can be set using the comma-separated `DEMANDIQ_CORS_ORIGINS` environment variable.
+To use a different API URL in the frontend, set `NEXT_PUBLIC_DEMANDIQ_API_URL` in `web/.env.local`. Set `DEMANDIQ_CORS_ORIGINS` to the deployed frontend origin(s), comma-separated, for cross-origin API access.
 
 ## Checks
 
