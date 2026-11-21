@@ -3,11 +3,12 @@ Demo data generator for DemandIQ.
 
 Generates a small, reproducible synthetic dataset that mimics real retail sales patterns:
   - Weekly seasonality (higher sales on weekends)
-  - Slight upward trend over time
-  - Promotion spikes (+30-50% lift)
-  - Occasional holidays (zero or near-zero sales)
-  - Some zero-demand days (stockouts or slow movers)
-  - Log-normal noise for realistic skewness
+  - Gentle trend and a slowly drifting local level
+  - Promotion spikes (+25-60% lift)
+  - Product-specific annual seasonality (e.g. a December peak for toys)
+  - Holidays with sharply reduced demand
+  - Whole-unit, over-dispersed (negative binomial) daily counts
+  - Occasional stock-out days with zero sales
 
 This data is CLEARLY LABELED as synthetic demo data.
 It is NOT presented as real retail sales.
@@ -66,10 +67,24 @@ PRODUCT_METADATA = [
 ]
 
 # Ecuadorian national holidays (simplified)
-HOLIDAYS_2013 = ["2013-01-01", "2013-02-11", "2013-04-01", "2013-05-01", "2013-05-24", "2013-07-24", "2013-08-10", "2013-10-09", "2013-11-02", "2013-11-03", "2013-12-25"]
-HOLIDAYS_2014 = ["2014-01-01", "2014-03-03", "2014-04-18", "2014-05-01", "2014-05-24", "2014-07-24", "2014-08-10", "2014-10-09", "2014-11-02", "2014-11-03", "2014-12-25"]
-HOLIDAYS_2015 = ["2015-01-01", "2015-02-16", "2015-04-03", "2015-05-01", "2015-05-24", "2015-07-24", "2015-08-10", "2015-10-09", "2015-11-02", "2015-11-03", "2015-12-25"]
-ALL_HOLIDAYS = set(HOLIDAYS_2013 + HOLIDAYS_2014 + HOLIDAYS_2015)
+from demandiq.data.calendar import KNOWN_HOLIDAYS  # noqa: E402
+
+ALL_HOLIDAYS = set(KNOWN_HOLIDAYS)
+
+# Seasonal character per product family: (annual amplitude, peak day-of-year).
+# Toys and electronics peak before Christmas; beverages peak in the warm season.
+FAMILY_SEASONALITY = {
+    "TOYS": (0.55, 355),
+    "ELECTRONICS": (0.40, 352),
+    "BEAUTY": (0.20, 350),
+    "BEVERAGES": (0.25, 70),
+    "GROCERY I": (0.10, 355),
+    "FROZEN FOODS": (0.18, 60),
+}
+DEFAULT_SEASONALITY = (0.08, 355)
+
+# Day-of-week shape (Mon..Sun): weekend shopping peak.
+DOW_SHAPE = np.array([0.92, 0.85, 0.90, 1.00, 1.12, 1.32, 1.22])
 
 
 def generate_sales(
@@ -80,72 +95,66 @@ def generate_sales(
     product_factor: float,
     promotion_dates: set[str],
     holiday_dates: set[str],
+    weekly_strength: float = 1.0,
+    annual_amplitude: float = 0.10,
+    annual_peak_doy: int = 355,
 ) -> pd.Series:
     """
-    Generate daily sales for a single store-product series.
+    Generate daily unit sales (whole units) for a single store-product series.
 
-    Signal model:
-        sales(t) = base * store_factor * product_factor
-                   * trend(t)
-                   * weekly_seasonality(t)
-                   * promotion_effect(t)
-                   * holiday_effect(t)
-                   * noise(t)
+    Expected demand:
+        mean(t) = base * store_factor * product_factor
+                  * trend(t) * weekly(t) * annual(t)
+                  * promotion(t) * holiday(t) * local_level(t)
 
-    All parameters are seeded for reproducibility.
+    Realised sales are drawn from a negative binomial (gamma-Poisson) around
+    that mean, so values are integers and over-dispersed like real retail
+    counts. A small share of days are zeroed to mimic stock-outs.
     """
     n = len(dates)
     t = np.arange(n)
 
-    # Trend: 0-15% total growth over the period
-    trend = 1.0 + rng.uniform(0.0, 0.15) * t / max(n, 1)
+    # Trend: between -5% and +25% over the full period
+    trend = 1.0 + rng.uniform(-0.05, 0.25) * t / max(n, 1)
 
-    # Weekly seasonality: day-of-week multipliers
-    dow_weights = np.array([1.0, 0.9, 0.95, 1.05, 1.2, 1.4, 1.3])  # Mon-Sun
-    weekly_season = np.array([dow_weights[d.weekday()] for d in dates])
+    # Weekly pattern, with product-specific strength
+    weekly = 1.0 + weekly_strength * (DOW_SHAPE[dates.dayofweek] - 1.0)
 
-    # Annual seasonality: mild December peak
-    annual_season = np.asarray(
-        1.0 + 0.1 * np.sin(2 * np.pi * (dates.dayofyear - 355) / 365),
-        dtype=float,
+    # Annual pattern peaking on `annual_peak_doy`
+    annual = 1.0 + annual_amplitude * np.cos(
+        2 * np.pi * (np.asarray(dates.dayofyear, dtype=float) - annual_peak_doy) / 365.25
     )
 
-    # Promotion effect: +30-50% lift on promo days
+    # Promotions lift demand by 25-60%
     promo_flags = np.array([d.strftime("%Y-%m-%d") in promotion_dates for d in dates], dtype=float)
-    promo_lift = rng.uniform(0.3, 0.5)
-    promo_effect = 1.0 + promo_lift * promo_flags
+    promo_effect = 1.0 + rng.uniform(0.25, 0.60) * promo_flags
 
-    # Holiday effect: demand drops to 5-30% on holidays
+    # Holidays cut demand to 10-40% of normal
     holiday_flags = np.array([d.strftime("%Y-%m-%d") in holiday_dates for d in dates], dtype=float)
-    holiday_drop = rng.uniform(0.05, 0.30)
-    holiday_effect = 1.0 - (1.0 - holiday_drop) * holiday_flags
+    holiday_effect = 1.0 - (1.0 - rng.uniform(0.10, 0.40)) * holiday_flags
 
-    # Log-normal multiplicative noise
-    noise = rng.lognormal(mean=0.0, sigma=0.15, size=n)
+    # Slowly drifting local level (AR(1) in log space)
+    log_level = np.zeros(n)
+    shocks = rng.normal(0.0, 0.025, size=n)
+    for i in range(1, n):
+        log_level[i] = 0.97 * log_level[i - 1] + shocks[i]
+    local_level = np.exp(log_level)
 
-    raw_sales = (
-        base_demand
-        * store_factor
-        * product_factor
-        * trend
-        * weekly_season
-        * annual_season
-        * promo_effect
-        * holiday_effect
-        * noise
+    mean = (
+        base_demand * store_factor * product_factor
+        * trend * weekly * annual * promo_effect * holiday_effect * local_level
     )
+    mean = np.maximum(mean, 0.0)
 
-    # Clip negatives (shouldn't happen, but defensive)
-    raw_sales = np.maximum(raw_sales, 0.0)
+    # Gamma-Poisson draw -> whole units with realistic over-dispersion
+    dispersion = 25.0
+    sales = rng.poisson(mean * rng.gamma(dispersion, 1.0 / dispersion, size=n)).astype(float)
 
-    # Introduce genuine zeros for slow-moving products (sparse demand)
-    # Work on numpy array explicitly before wrapping in pd.Series
-    raw_sales = raw_sales.copy()
-    zero_prob = max(0.0, rng.uniform(-0.05, 0.15))  # 0-15% chance of zero-day
-    zero_mask = rng.random(n) < zero_prob
-    raw_sales[zero_mask] = 0.0
+    # Occasional stock-out days (0-3% of days)
+    stockout_mask = rng.random(n) < rng.uniform(0.0, 0.03)
+    sales[stockout_mask] = 0.0
 
-    return pd.Series(np.round(raw_sales, 2), index=dates, name="units_sold")
+    return pd.Series(sales.astype(int), index=dates, name="units_sold")
 
 
 def generate_promotions(
@@ -194,11 +203,13 @@ def run_generator(
     all_rows = []
     store_factors = {s["store_id"]: rng.uniform(0.6, 1.4) for s in stores}
     product_factors = {p["product_id"]: rng.uniform(0.5, 2.0) for p in products}
-    base_demands = {p["product_id"]: rng.uniform(10, 150) for p in products}
+    base_demands = {p["product_id"]: rng.uniform(8, 120) for p in products}
+    weekly_strengths = {p["product_id"]: rng.uniform(0.5, 1.4) for p in products}
 
     for store in stores:
         promo_dates = generate_promotions(rng, dates)
         for product in products:
+            amplitude, peak = FAMILY_SEASONALITY.get(product["family"], DEFAULT_SEASONALITY)
             sales = generate_sales(
                 rng=rng,
                 dates=dates,
@@ -207,6 +218,9 @@ def run_generator(
                 product_factor=product_factors[product["product_id"]],
                 promotion_dates=promo_dates,
                 holiday_dates=ALL_HOLIDAYS,
+                weekly_strength=weekly_strengths[product["product_id"]],
+                annual_amplitude=amplitude,
+                annual_peak_doy=peak,
             )
             rows = pd.DataFrame(
                 {
@@ -254,8 +268,9 @@ def run_generator(
             "linear_trend",
             "promotion_lift",
             "holiday_effect",
-            "lognormal_noise",
-            "sparse_zero_demand",
+            "drifting_local_level",
+            "negative_binomial_counts",
+            "stockout_zero_days",
         ],
     }
     import json

@@ -1,0 +1,9 @@
+{
+  "series": 100,
+  "horizon_days": 14,
+  "backtest_folds": 12,
+  "fold_step_days": 7,
+  "interval_method": "horizon-aware conformal on rolling-origin residuals",
+  "data": "synthetic demo data (see data/demo/metadata.json)",
+  "runtime_seconds": 113.1
+}

@@ -43,7 +43,7 @@ class Config:
         for m in os.getenv("ENABLED_MODELS", "naive,seasonal_naive,ets,lgbm").split(",")
     ]
     DEFAULT_HORIZON: int = int(os.getenv("DEFAULT_HORIZON", "14"))
-    BACKTEST_SPLITS: int = int(os.getenv("BACKTEST_SPLITS", "3"))
+    BACKTEST_SPLITS: int = int(os.getenv("BACKTEST_SPLITS", "12"))
     MIN_TRAIN_PERIODS: int = int(os.getenv("MIN_TRAIN_PERIODS", "60"))  # days
 
     # --- Reproducibility ---

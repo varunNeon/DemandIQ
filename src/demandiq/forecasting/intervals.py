@@ -213,3 +213,80 @@ class ConformalIntervalWrapper:
             report[f"nominal_{label}"] = level
 
         return report
+
+
+def horizon_conformal_bands(
+    point: np.ndarray,
+    residuals: np.ndarray,
+    levels: list[float] | None = None,
+    window: int = 2,
+    calibration_predictions: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Horizon-aware split-conformal intervals from rolling-origin residuals.
+
+    Parameters
+    ----------
+    point : Point forecast for steps 1..H.
+    residuals : Signed residuals (actual - predicted) with shape
+        (n_calibration_folds, H). Every calibration fold must be fully
+        observed before the forecast origin, so no future data leaks in.
+    levels : Nominal coverage levels, e.g. [0.80, 0.95].
+    window : Residuals from steps h-window .. h+window are pooled for step h.
+        Pooling neighbouring steps adds calibration samples while still
+        letting intervals widen as the horizon grows.
+
+    calibration_predictions : Optional point forecasts matching `residuals`.
+        When given, residuals are normalised by sqrt(prediction + 1) and the
+        bands are rescaled by sqrt(point + 1). Count-like demand has variance
+        that grows with its level, so this keeps intervals proportionate in
+        busy and quiet periods (a locally weighted conformal score).
+
+    Signed (not absolute) residual quantiles are used, so intervals can be
+    asymmetric. That matters for skewed demand counts, where under-forecasts
+    are usually larger than over-forecasts.
+
+    Returns a dict with "point" plus "lower_XX"/"upper_XX" per level.
+    Lower bounds are clipped at zero.
+    """
+    levels = levels or [0.80, 0.95]
+    point = np.maximum(np.asarray(point, dtype=float), 0.0)
+    result: dict[str, np.ndarray] = {"point": point}
+
+    residuals = np.atleast_2d(np.asarray(residuals, dtype=float))
+    if residuals.size == 0:
+        return result
+
+    point_scale = np.ones_like(point)
+    if calibration_predictions is not None:
+        cal_scale = np.sqrt(np.maximum(np.atleast_2d(calibration_predictions), 0.0) + 1.0)
+        residuals = residuals / cal_scale
+        point_scale = np.sqrt(point + 1.0)
+
+    horizon = len(point)
+    n_steps = residuals.shape[1]
+    for level in levels:
+        lower = np.empty(horizon)
+        upper = np.empty(horizon)
+        for h in range(horizon):
+            lo_step = max(0, h - window)
+            hi_step = min(n_steps, h + window + 1)
+            pool = residuals[:, lo_step:hi_step].ravel()
+            pool = pool[np.isfinite(pool)]
+            if len(pool) == 0:
+                lower[h], upper[h] = np.nan, np.nan
+                continue
+            n = len(pool)
+            # Finite-sample correction: widen the quantile levels slightly.
+            alpha = 1.0 - level
+            q_lo = max(0.0, (alpha / 2) * (1 - 1 / (n + 1)))
+            q_hi = min(1.0, (1 - alpha / 2) * (1 + 1 / (n + 1)))
+            lower[h] = point[h] + point_scale[h] * np.quantile(pool, q_lo)
+            upper[h] = point[h] + point_scale[h] * np.quantile(pool, q_hi)
+        # Keep the point inside its band (only ever widens, so coverage cannot drop).
+        lower = np.minimum(lower, point)
+        upper = np.maximum(upper, point)
+        label = f"{int(round(level * 100))}"
+        result[f"lower_{label}"] = np.maximum(lower, 0.0)
+        result[f"upper_{label}"] = upper
+    return result

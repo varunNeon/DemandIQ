@@ -1,103 +1,113 @@
-<div align="center">
+# DemandIQ
 
-# DEMAND<span style="color:#d9b65d">IQ</span>
+**Probabilistic demand forecasting and inventory planning, measured honestly.**
 
-### Probabilistic demand forecasting & inventory intelligence
-
-Explore sales signals, review saved forecasts, and inspect inventory recommendations in a dark, data-focused workspace.
+DemandIQ forecasts daily demand for every store and product, puts a calibrated uncertainty band
+around each forecast, and turns that band into a reorder decision. Every accuracy figure comes
+from a rolling-origin backtest on weeks the models never trained on.
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
-![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js)
-![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)
-![Database](https://img.shields.io/badge/Database-PostgreSQL%20%7C%20SQLite-4169E1?logo=postgresql&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Active%20development-D9B65D)
+![LightGBM](https://img.shields.io/badge/LightGBM-direct%20multi--horizon-D9B65D)
+![Streamlit](https://img.shields.io/badge/Streamlit-app-FF4B4B?logo=streamlit&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-read%20API-009688?logo=fastapi&logoColor=white)
+![Next.js](https://img.shields.io/badge/Next.js-workspace-black?logo=next.js)
+![Tests](https://img.shields.io/badge/tests-27%20passing-D9B65D)
 
-[Features](#what-you-can-do) · [How it works](#how-it-works) · [Quick start](#quick-start) · [API](#api) · [Roadmap](#current-scope)
+![DemandIQ overview: headline result and a LightGBM forecast with 80% and 95% intervals](docs/images/hero.png)
 
-</div>
+## Results
 
----
+Benchmarked on 100 store–product series (5 stores × 20 products, two years of daily sales),
+forecasting 14 days ahead over 12 rolling backtest windows:
 
-## What you can do
+| Model | WAPE | MASE | Inside 80% band | Inside 95% band | Most accurate on |
+|---|---:|---:|---:|---:|---:|
+| **LightGBM** | **23.3%** | **0.76** | 75% | 89% | **97 / 100** |
+| ETS (Holt-Winters) | 26.5% | 0.87 | 78% | 91% | 3 / 100 |
+| Seasonal naive | 36.5% | 1.18 | 81% | 91% | 0 / 100 |
+| Naive | 38.0% | 1.24 | 75% | 88% | 0 / 100 |
 
-<details open>
-<summary><strong>Explore the workspace</strong></summary>
+LightGBM's error is **39% lower than the naive baseline**. The intervals come out a little
+narrow: 75% and 89% observed against 80% and 95% targets. That's reported as measured; the
+[limits](#known-limits) section explains why.
 
-| Area | What it shows | Current state |
-|---|---|---|
-| **Overview** | Sales coverage, stores and products, recent forecast activity, and a selected demand series | Available in Next.js |
-| **Demand signals** | Historical sales by store and product, with daily details | Available in Next.js |
-| **Forecast runs** | Saved model runs, evaluation metrics, and forecast intervals | Available in Next.js; runs are created by the Python pipeline |
-| **Inventory advisor** | Saved replenishment suggestions and their explanation | Available in Next.js when recommendations exist |
-| **Forecast engine** | Naive, seasonal-naive, ETS, and LightGBM forecasting with rolling-origin backtesting | Python modules and CLI |
-| **Inventory engine** | Reorder-point and periodic-review policies, plus inventory simulation | Python modules |
-| **Data pipeline** | Demo data generation, CSV ingestion, and input validation | Python CLI |
+Reproduce the table with `python scripts/run_benchmark.py`. It takes about two minutes with 12 worker processes.
 
-</details>
+## The app
 
-<details>
-<summary><strong>How forecasts are evaluated</strong></summary>
-
-DemandIQ includes rolling-origin backtesting and measures such as MAE, RMSE, WAPE, and MASE. It also calculates prediction intervals and records observed interval coverage. Forecast quality should be judged against the data and series being evaluated; interval coverage is measured evidence, not a guarantee.
-
-</details>
+| | |
+|---|---|
+| **Overview.** The headline result, a live forecast for any series, the model leaderboard, and error by days ahead. | **Demand explorer.** Promotion lift, weekday and seasonal patterns, holidays, and how the series compares with the rest of the store's range. |
+| ![Overview](docs/images/overview.png) | ![Demand explorer](docs/images/demand.png) |
+| **Forecast lab.** Run all four models live, plan a promotion and watch LightGBM respond, replay the backtest, check interval coverage and feature importance, export the forecast. | **Inventory planner.** Set service level, lead time, stock and costs to get a reorder decision, a projected stock path, and a six-month simulation of what each service level costs. |
+| ![Forecast lab](docs/images/forecast.png) | ![Inventory planner](docs/images/inventory.png) |
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    CSV[Demo or sales CSVs] --> INGEST[Python ingestion & validation]
-    INGEST --> DB[(SQLite locally / PostgreSQL when configured)]
-    DB --> API[FastAPI read API]
-    API --> WEB[Next.js workspace]
-    DB --> PIPE[Python forecasting pipeline]
-    PIPE --> EVAL[Backtesting & metrics]
-    PIPE --> SAVE[Saved forecasts]
-    SAVE --> DB
-    INV[Inventory policies & simulator] --> DB
+    CSV[Sales, promotions, holidays] --> VAL[Validation and bulk ingestion]
+    VAL --> DB[(SQLite / PostgreSQL)]
+    DB --> BT[Rolling-origin backtest]
+    BT --> CAL[Horizon-aware conformal intervals]
+    CAL --> FC[14-day probabilistic forecast]
+    FC --> INV[Reorder point, safety stock, order size]
+    INV --> SIM[Lost-sales simulation]
+    DB --> API[FastAPI] --> WEB[Next.js workspace]
+    FC --> APP[Streamlit app]
+    SIM --> APP
 ```
 
-The Next.js app reads data through FastAPI. Forecasting and inventory calculations live in Python, so the business logic is separate from the interface. Today, the web UI displays saved results; forecast creation and recommendation controls have not yet been added to the Next.js/API workflow.
+**Evaluation without leakage.** Twelve forecast origins, one week apart, each forecasting 14 days
+from only the history before it. No random splits. Accuracy is reported as WAPE, MASE and bias.
+MAPE is left out because it breaks on zero-sales days.
+
+**LightGBM as one direct multi-horizon model.** Each training row pairs a forecast origin with a
+day ahead. Features are things known at the origin: recent demand, rolling level and volatility,
+same-weekday history, and last year's demand around the target date. They also include facts
+known in advance about the target day: weekday, season, holidays and planned promotions. Demand
+inputs and the target are divided by the recent 28-day level, so the trees learn shapes rather
+than volumes and can follow trends. A test checks that changing demand after the origin cannot
+change a forecast.
+
+**Intervals calibrated on real misses.** For each distance ahead, the band comes from the model's
+own backtest errors at similar distances. Errors are scaled by the square root of the forecast
+level, since busy days miss by more in absolute terms. Signed quantiles keep the bands
+asymmetric for skewed demand. Coverage is tested sequentially: a backtest window is only
+calibrated on earlier windows that had fully played out before its origin.
+
+**From forecast to order.** The 80% band becomes a per-day error standard deviation. Lead-time
+demand and its spread set the reorder point at the chosen service level. Order size follows
+the economic order quantity. A lost-sales simulator replays six months of demand and makes each
+decision with only the data available on that day.
 
 ## Quick start
 
-### 1. Install Python dependencies
-
-From the repository root:
-
 ```powershell
-python -m pip install -e .
+python -m pip install -e ".[dev]"
+streamlit run streamlit_app.py
 ```
 
-Python 3.11 or newer is required. SQLite is used by default for local development. Set `DATABASE_URL` to a PostgreSQL connection string to use PostgreSQL instead.
+The app creates a local SQLite database and loads the demo data on first run. Then open
+<http://localhost:8501>.
 
-### 2. Load demo data
-
-To use the demo CSVs already in `data/demo/`:
+### Command-line pipeline
 
 ```powershell
 python scripts/run_pipeline.py --ingest
+python scripts/run_pipeline.py --train --recommend --sample
+python scripts/run_benchmark.py
 ```
 
-To regenerate the demo data first:
+`--train` backtests and saves forecasts. Re-running replaces earlier runs instead of duplicating
+them. `--recommend` saves a reorder recommendation per series from its most accurate model.
+`--generate-demo` rebuilds the synthetic data.
 
-```powershell
-python scripts/run_pipeline.py --generate-demo --ingest
-```
-
-### 3. Start the API
-
-In the first terminal, from the repository root:
+### API and Next.js workspace
 
 ```powershell
 python -m uvicorn demandiq.api.main:app --reload
 ```
-
-The API health check is at <http://localhost:8000/health>; interactive API docs are at <http://localhost:8000/docs>.
-
-### 4. Start the website
-
-In a second terminal:
 
 ```powershell
 cd web
@@ -105,76 +115,52 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>.
+The FastAPI service exposes read endpoints (`/health`, `/api/v1/overview`, `/stores`,
+`/products`, `/sales/{store}/{product}`, `/forecast-runs`, `/forecast-runs/{id}`,
+`/inventory/recommendations`) with docs at <http://localhost:8000/docs>. The Next.js app at
+<http://localhost:3000> reads saved runs and recommendations from it. Set `DATABASE_URL` to a
+PostgreSQL connection string to use PostgreSQL instead of SQLite.
 
-<details>
-<summary><strong>Connect to PostgreSQL or a hosted API</strong></summary>
+## Deploying the Streamlit app for free
 
-Set these environment variables in your local environment or hosting provider:
+1. Push the repository to GitHub.
+2. Create an app at [share.streamlit.io](https://share.streamlit.io), pick the repository, and set
+   the main file to `streamlit_app.py`.
+3. `requirements.txt` installs the package. The demo database builds itself on first load.
 
-| Variable | Used by | Purpose |
-|---|---|---|
-| `DATABASE_URL` | FastAPI / Python | SQLAlchemy database connection. Use PostgreSQL for hosted deployments. |
-| `DEMANDIQ_CORS_ORIGINS` | FastAPI | Comma-separated frontend origins allowed to call the API. |
-| `NEXT_PUBLIC_DEMANDIQ_API_URL` | Next.js | Base URL of the FastAPI service; locally defaults to `http://localhost:8000`. |
+## Project layout
 
-For local Next.js configuration, put `NEXT_PUBLIC_DEMANDIQ_API_URL` in `web/.env.local`. Never commit database credentials or other secrets.
-
-</details>
-
-## API
-
-The current API is read-only:
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `GET` | `/health` | API and database health |
-| `GET` | `/api/v1/overview` | Workspace summary |
-| `GET` | `/api/v1/stores` | Store list |
-| `GET` | `/api/v1/products` | Product list |
-| `GET` | `/api/v1/sales/{store_id}/{product_id}` | Sales history for one series |
-| `GET` | `/api/v1/forecast-runs` | Saved forecast runs |
-| `GET` | `/api/v1/forecast-runs/{run_id}` | Run details and forecasts |
-| `GET` | `/api/v1/inventory/recommendations` | Saved replenishment recommendations |
-
-## Current scope
-
-<details>
-<summary><strong>Implemented</strong></summary>
-
-- Next.js pages for overview, demand signals, forecast runs, and inventory recommendations.
-- FastAPI endpoints to read the workspace data and saved results.
-- Python data ingestion, validation, feature engineering, forecasting, backtesting, and inventory modules.
-- SQLite for local use and PostgreSQL support through `DATABASE_URL`.
-
-</details>
-
-<details>
-<summary><strong>Next product steps</strong></summary>
-
-- Add authenticated API actions to run forecasts and create inventory recommendations.
-- Add matching controls and parameter forms to the Next.js pages.
-- Add database migrations and a deployment-safe data initialization process.
-- Deploy the frontend, API, and PostgreSQL database.
-
-</details>
+```text
+streamlit_app.py            Streamlit entry point and navigation
+src/demandiq/
+  app/                      Streamlit theme, charts, cached data access, pages
+  forecasting/              baselines, ETS, LightGBM, backtesting, conformal intervals, metrics
+  inventory/                reorder-point and periodic-review policies, simulator
+  services/                 forecast and inventory orchestration (pure functions + persistence)
+  data/                     ingestion, validation, features, holiday calendar
+  database/                 SQLAlchemy models, connection, repositories
+  api/                      FastAPI read API
+scripts/                    pipeline CLI, benchmark, demo-data generator
+web/                        Next.js workspace
+tests/                      27 tests: leakage, intervals, inventory maths, pipeline, API
+```
 
 ## Development checks
 
 ```powershell
 python -m pytest
+python -m ruff check src scripts tests streamlit_app.py
 ```
 
-```powershell
-cd web
-npm run lint
-npm run build
-```
+## Known limits
 
----
-
-<div align="center">
-
-**DemandIQ** · Built with Python, FastAPI, Next.js, and PostgreSQL
-
-</div>
+- **The demo data is synthetic.** It has realistic structure: weekly and annual seasonality,
+  promotions, holidays, a drifting local level, over-dispersed whole-unit counts and stock-out
+  days. It is still not real sales data.
+- **Intervals run slightly narrow.** Calibration only uses earlier weeks, so seasonal shifts it
+  hasn't seen yet (the run-up to December, for example) push coverage below target.
+- **Future promotions are assumed absent** unless planned in the Forecast lab.
+- **Inventory inputs are assumptions.** Lead times, costs and stock on hand are operating inputs,
+  not facts learned from the data.
+- The API is read-only and has no authentication; forecasts are created by the pipeline or the
+  Streamlit app.

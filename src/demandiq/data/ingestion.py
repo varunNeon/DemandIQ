@@ -17,10 +17,8 @@ import logging
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from demandiq.config import settings
 from demandiq.data.validation import validate_products, validate_sales, validate_stores
 from demandiq.database.connection import get_db, init_db
 from demandiq.database.models import Product, SalesHistory, Store
@@ -95,37 +93,38 @@ def _bulk_upsert_sales(session: Session, df: pd.DataFrame, data_source: str) -> 
     df = df.drop_duplicates(subset=["date", "store_id", "product_id"], keep="first")
 
     total = len(df)
-    inserted = 0
 
-    # Batch insert using ORM (portable across SQLite and PostgreSQL)
-    # For large datasets this should be replaced with bulk_insert_mappings
-    BATCH_SIZE = 500
-    for start in range(0, total, BATCH_SIZE):
-        batch = df.iloc[start : start + BATCH_SIZE]
-        for _, row in batch.iterrows():
-            existing = (
-                session.query(SalesHistory)
-                .filter_by(
-                    date=row["date"],
-                    store_id=row["store_id"],
-                    product_id=row["product_id"],
-                )
-                .first()
-            )
-            if not existing:
-                session.add(
-                    SalesHistory(
-                        date=row["date"],
-                        store_id=row["store_id"],
-                        product_id=row["product_id"],
-                        units_sold=float(row["units_sold"]),
-                        onpromotion=bool(row["onpromotion"]),
-                        is_holiday=bool(row["is_holiday"]),
-                        data_source=data_source,
-                    )
-                )
-                inserted += 1
-        session.flush()  # Flush each batch
+    # Load the keys that already exist for these series in one query, then
+    # bulk-insert only new rows. Portable across SQLite and PostgreSQL.
+    existing_keys: set[tuple] = set()
+    for store_id in df["store_id"].unique():
+        rows = (
+            session.query(SalesHistory.date, SalesHistory.product_id)
+            .filter(SalesHistory.store_id == store_id)
+            .all()
+        )
+        existing_keys.update((d, store_id, p) for d, p in rows)
+
+    keys = list(zip(df["date"], df["store_id"], df["product_id"]))
+    new_rows = df[[k not in existing_keys for k in keys]]
+
+    mappings = [
+        {
+            "date": row.date,
+            "store_id": row.store_id,
+            "product_id": row.product_id,
+            "units_sold": float(row.units_sold),
+            "onpromotion": bool(row.onpromotion),
+            "is_holiday": bool(row.is_holiday),
+            "data_source": data_source,
+        }
+        for row in new_rows.itertuples(index=False)
+    ]
+    BATCH_SIZE = 5000
+    for start in range(0, len(mappings), BATCH_SIZE):
+        session.bulk_insert_mappings(SalesHistory, mappings[start : start + BATCH_SIZE])
+    session.flush()
+    inserted = len(mappings)
 
     skipped = total - inserted
     return inserted, skipped

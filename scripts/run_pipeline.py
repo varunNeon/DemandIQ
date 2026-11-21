@@ -22,7 +22,6 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "src"))
 
-import shutil
 
 from rich.console import Console
 from rich.panel import Panel
@@ -30,13 +29,11 @@ from rich.table import Table
 
 from demandiq.config import settings
 from demandiq.data.ingestion import ingest_directory
-from demandiq.database.connection import init_db
+from demandiq.database.connection import get_db, init_db
 from demandiq.database.repositories import (
     get_product_ids,
-    get_sales_date_range,
     get_store_ids,
 )
-from demandiq.database.connection import get_db
 
 console = Console()
 
@@ -87,29 +84,41 @@ def cmd_ingest(args) -> None:
             console.print(f"  [{color}][{severity.upper()}][/] {issue['issue_type']}: {issue.get('details', '')}")
 
 
+def _selected_series(args) -> tuple[list[str], list[str]]:
+    """Store and product ids after applying --store/--product/--sample filters."""
+    with get_db() as session:
+        store_ids = get_store_ids(session)
+        product_ids = get_product_ids(session)
+    if args.store:
+        store_ids = [s for s in store_ids if s == args.store]
+    if args.product:
+        product_ids = [p for p in product_ids if p == args.product]
+    if args.sample:
+        store_ids = store_ids[: args.sample_stores]
+        product_ids = product_ids[: args.sample_products]
+    return store_ids, product_ids
+
+
+def cmd_recommend(args) -> None:
+    """Create reorder-point recommendations from the most accurate saved runs."""
+    from demandiq.services.inventory_service import generate_recommendations
+
+    console.print(Panel("[bold cyan]Creating Replenishment Recommendations[/]"))
+    store_ids, product_ids = _selected_series(args)
+    created = generate_recommendations(store_ids, product_ids)
+    console.print(f"[green]OK[/] {created} recommendations saved (default operating assumptions).")
+
+
 def cmd_train(args) -> None:
     """Train forecast models."""
     from demandiq.services.forecast_service import run_forecast_pipeline
 
     console.print(Panel("[bold cyan]Training Forecast Models[/]"))
 
-    with get_db() as session:
-        store_ids = get_store_ids(session)
-        product_ids = get_product_ids(session)
-
+    store_ids, product_ids = _selected_series(args)
     if not store_ids or not product_ids:
         console.print("[red]No data found. Run ingestion first.[/]")
         return
-
-    # Limit to sample for quick runs
-    if args.store:
-        store_ids = [s for s in store_ids if s == args.store]
-    if args.product:
-        product_ids = [p for p in product_ids if p == args.product]
-
-    if args.sample:
-        store_ids = store_ids[: args.sample_stores]
-        product_ids = product_ids[: args.sample_products]
 
     total = len(store_ids) * len(product_ids)
     console.print(f"Training on {len(store_ids)} stores × {len(product_ids)} products = {total} series")
@@ -130,20 +139,20 @@ def cmd_train(args) -> None:
                     for model, res in results.items():
                         if "error" in res:
                             errors += 1
-                            console.print(f"  [red]ERROR[/] {store_id}/{product_id} [{model}] {res['error']}")
+                            console.print(f"  [red]ERROR[/] {store_id}/{product_id} \\[{model}] {res['error']}")
                             continue
                         trained += 1
                         if "metrics" in res:
                             m = res["metrics"]
                             console.print(
-                                f"  [green]OK[/] {store_id}/{product_id} [{model}] "
+                                f"  [green]OK[/] {store_id}/{product_id} \\[{model}] "
                                 f"MAE={m.get('MAE', 'N/A'):.2f} WAPE={m.get('WAPE', 'N/A'):.3f}"
                             )
             except Exception as exc:
                 errors += 1
                 console.print(f"  [red]ERROR[/] {store_id}/{product_id}: {exc}")
 
-    console.print(f"\n[bold]Done:[/] {trained} series trained, {errors} errors.")
+    console.print(f"\n[bold]Done:[/] {trained} model runs saved, {errors} errors.")
 
 
 def main() -> None:
@@ -151,7 +160,8 @@ def main() -> None:
     parser.add_argument("--generate-demo", action="store_true", help="Regenerate demo data before running")
     parser.add_argument("--ingest", action="store_true", help="Run data ingestion")
     parser.add_argument("--train", action="store_true", help="Train forecast models")
-    parser.add_argument("--all", action="store_true", help="Run full pipeline (demo → ingest → train)")
+    parser.add_argument("--recommend", action="store_true", help="Create inventory recommendations")
+    parser.add_argument("--all", action="store_true", help="Run full pipeline (demo → ingest → train → recommend)")
 
     parser.add_argument("--store", type=str, help="Filter to specific store_id")
     parser.add_argument("--product", type=str, help="Filter to specific product_id")
@@ -181,8 +191,11 @@ def main() -> None:
     if args.all or args.train:
         cmd_train(args)
 
-    if not any([args.all, args.generate_demo, args.ingest, args.train]):
-        console.print("[yellow]No action specified. Use --all, --generate-demo, --ingest, or --train.[/]")
+    if args.all or args.recommend:
+        cmd_recommend(args)
+
+    if not any([args.all, args.generate_demo, args.ingest, args.train, args.recommend]):
+        console.print("[yellow]No action specified. Use --all, --generate-demo, --ingest, --train or --recommend.[/]")
         parser.print_help()
 
 

@@ -2,18 +2,19 @@
   "data_type": "SYNTHETIC_DEMO",
   "warning": "This is synthetic data generated for demonstration purposes. It is NOT real retail data.",
   "seed": 42,
-  "n_stores": 2,
-  "n_products": 3,
-  "n_days": 100,
-  "date_range": "2015-09-23 to 2015-12-31",
-  "total_rows": 600,
+  "n_stores": 5,
+  "n_products": 20,
+  "n_days": 730,
+  "date_range": "2014-01-01 to 2015-12-31",
+  "total_rows": 73000,
   "signal_components": [
     "weekly_seasonality",
     "annual_seasonality",
     "linear_trend",
     "promotion_lift",
     "holiday_effect",
-    "lognormal_noise",
-    "sparse_zero_demand"
+    "drifting_local_level",
+    "negative_binomial_counts",
+    "stockout_zero_days"
   ]
 }

@@ -49,43 +49,66 @@ def inventory_position(on_hand: float, on_order: float, backorders: float) -> fl
 def lead_time_demand_stats(
     daily_demand_forecast: np.ndarray,
     lead_time_days: int,
-    forecast_std: float | None = None,
+    forecast_std: float | np.ndarray | None = None,
 ) -> tuple[float, float]:
     """
-    Estimate mean and standard deviation of demand during lead time.
+    Mean and standard deviation of total demand over the lead time.
 
     Parameters
     ----------
-    daily_demand_forecast : Forecast for each day of the lead time.
-    lead_time_days : Number of days until order arrives.
-    forecast_std : Optional per-day forecast standard deviation.
-                   If None, estimated from the coefficient of variation
-                   of the forecast series.
+    daily_demand_forecast : Point forecast for each upcoming day.
+    lead_time_days : Days until an order placed today arrives.
+    forecast_std : Forecast-error standard deviation, either one value for
+        every day or one value per day (e.g. derived from prediction
+        intervals with `std_from_interval`). Daily errors are assumed
+        independent, so variances add.
+        If None, a 30% coefficient of variation is assumed and should be
+        reported as an assumption.
 
     Returns
     -------
-    (mu_LT, sigma_LT) : Mean and std of lead-time demand.
+    (mu_LT, sigma_LT)
     """
-    # Use the first lead_time_days of the forecast
     horizon = min(lead_time_days, len(daily_demand_forecast))
-    lt_forecast = daily_demand_forecast[:horizon]
+    lt_forecast = np.asarray(daily_demand_forecast[:horizon], dtype=float)
+    # If the lead time is longer than the forecast, extend with the last week's average.
+    if lead_time_days > horizon and horizon > 0:
+        tail_mean = float(np.mean(lt_forecast[-7:]))
+        lt_forecast = np.concatenate([lt_forecast, np.full(lead_time_days - horizon, tail_mean)])
 
     mu_LT = float(np.sum(lt_forecast))
 
-    if forecast_std is not None:
-        # If per-day std provided, aggregate assuming independence
-        sigma_LT = float(np.sqrt(lead_time_days * forecast_std**2))
+    if forecast_std is None:
+        daily_std = 0.30 * lt_forecast
     else:
-        # Estimate from forecast variability (conservative)
-        if len(lt_forecast) > 1:
-            daily_std = float(np.std(lt_forecast, ddof=1))
+        std = np.atleast_1d(np.asarray(forecast_std, dtype=float))
+        if len(std) == 1:
+            daily_std = np.full(len(lt_forecast), std[0])
         else:
-            # Fallback: assume 30% CV of mean daily demand
-            daily_mean = mu_LT / max(horizon, 1)
-            daily_std = 0.30 * daily_mean
-        sigma_LT = float(np.sqrt(lead_time_days) * daily_std)
+            std = std[: len(lt_forecast)]
+            if len(std) < len(lt_forecast):
+                std = np.concatenate([std, np.full(len(lt_forecast) - len(std), std[-1])])
+            daily_std = std
 
+    sigma_LT = float(np.sqrt(np.sum(np.square(daily_std))))
     return mu_LT, sigma_LT
+
+
+def std_from_interval(lower: np.ndarray, upper: np.ndarray, level: float = 0.80) -> np.ndarray:
+    """
+    Convert a central prediction interval into an approximate standard
+    deviation, assuming roughly normal forecast errors:
+    sigma = (upper - lower) / (2 * z), with z the normal quantile for the level.
+    """
+    z = float(stats.norm.ppf(0.5 + level / 2))
+    return np.maximum((np.asarray(upper, float) - np.asarray(lower, float)) / (2 * z), 0.0)
+
+
+def stockout_probability(inventory_position: float, mu_LT: float, sigma_LT: float) -> float:
+    """P(lead-time demand exceeds the current inventory position), normal approximation."""
+    if sigma_LT <= 0:
+        return float(mu_LT > inventory_position)
+    return float(1.0 - stats.norm.cdf((inventory_position - mu_LT) / sigma_LT))
 
 
 class ReorderPointPolicy:
@@ -154,11 +177,12 @@ class ReorderPointPolicy:
             K = ordering cost per order
             h = annual holding cost per unit (holding_cost_per_unit_day * 365)
 
-        Note: unit_cost is included in holding cost calculation
-        (holding cost = holding_cost_rate * unit_cost * annual_demand_per_unit).
+        `unit_cost` is accepted for interface compatibility; the holding cost
+        passed in is already expressed per unit per day.
         """
         annual_demand = daily_demand * 365
-        annual_holding = (holding_cost_per_unit_day + holding_cost_per_unit_day * unit_cost) * 365
+        # holding_cost_per_unit_day is already a cost per unit per day
+        annual_holding = holding_cost_per_unit_day * 365
 
         if annual_holding <= 0 or annual_demand <= 0:
             logger.warning("EOQ: invalid inputs (D=%.2f, h=%.2f). Returning 1.", annual_demand, annual_holding)
@@ -173,7 +197,7 @@ class ReorderPointPolicy:
         ordering_cost: float = 50.0,
         holding_cost_per_unit_day: float = 0.05,
         unit_cost: float = 10.0,
-        forecast_std: float | None = None,
+        forecast_std: float | np.ndarray | None = None,
     ) -> dict:
         """
         Compute full replenishment recommendation.
@@ -209,6 +233,7 @@ class ReorderPointPolicy:
         order_qty = max(order_qty, float(self.params.min_order_qty))
 
         should_order = inv_pos <= rop
+        risk = stockout_probability(inv_pos, mu_LT, sigma_LT)
 
         if should_order:
             explanation = (
@@ -238,6 +263,8 @@ class ReorderPointPolicy:
             "suggested_order_qty": round(order_qty, 0),
             "should_order": should_order,
             "service_level": self.params.service_level,
+            "stockout_risk": round(risk, 4),
+            "days_of_cover": round(inv_pos / daily_mean, 1) if daily_mean > 0 else None,
             "explanation": explanation,
         }
 
@@ -261,7 +288,7 @@ class PeriodicReviewPolicy:
     def compute_order_up_to_level(
         self,
         daily_demand_forecast: np.ndarray,
-        forecast_std: float | None = None,
+        forecast_std: float | np.ndarray | None = None,
     ) -> float:
         """
         Compute order-up-to level S.
@@ -270,15 +297,7 @@ class PeriodicReviewPolicy:
         S = mu_protection + z * sigma_protection.
         """
         protection_days = self.params.lead_time_days + self.review_period_days
-        protection_forecast = daily_demand_forecast[:protection_days]
-
-        mu_P = float(np.sum(protection_forecast))
-
-        if forecast_std is not None:
-            sigma_P = float(np.sqrt(protection_days * forecast_std**2))
-        else:
-            daily_std = float(np.std(protection_forecast, ddof=1)) if len(protection_forecast) > 1 else 0.3 * mu_P / max(protection_days, 1)
-            sigma_P = float(np.sqrt(protection_days) * daily_std)
+        mu_P, sigma_P = lead_time_demand_stats(daily_demand_forecast, protection_days, forecast_std)
 
         z = float(stats.norm.ppf(self.params.service_level))
         S = mu_P + z * sigma_P
@@ -287,7 +306,7 @@ class PeriodicReviewPolicy:
     def recommend(
         self,
         daily_demand_forecast: np.ndarray,
-        forecast_std: float | None = None,
+        forecast_std: float | np.ndarray | None = None,
     ) -> dict:
         """Compute periodic review recommendation."""
         inv_pos = inventory_position(

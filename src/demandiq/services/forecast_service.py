@@ -1,58 +1,248 @@
 """
 Forecast service for DemandIQ.
 
-Orchestrates: data retrieval → model training → backtesting
-             → future forecast generation → database storage.
+    data → rolling-origin backtest → conformal intervals → future forecast → database
 
-Keeps forecasting logic independent of the web interface and API layer.
+`forecast_series` is pure (no database), so the Streamlit app, the benchmark
+script and tests can all call it. `run_forecast_pipeline` wraps it with
+database loading and saving.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
 from demandiq.config import settings
+from demandiq.data.calendar import future_calendar
 from demandiq.database.connection import get_db
-from demandiq.database.models import Forecast, ForecastRun
-from demandiq.database.repositories import (
-    get_forecasts_dataframe,
-    get_latest_forecast_run,
-    get_sales_dataframe,
-)
-from demandiq.forecasting.backtesting import rolling_origin_backtest
+from demandiq.database.models import Forecast, ForecastRun, ReplenishmentRecommendation
+from demandiq.database.repositories import get_sales_dataframe
+from demandiq.forecasting.backtesting import BacktestSummary, rolling_origin_backtest
 from demandiq.forecasting.baselines import NaiveForecaster, SeasonalNaiveForecaster
-from demandiq.forecasting.intervals import ConformalIntervalWrapper
-from demandiq.forecasting.metrics import compute_all_metrics
+from demandiq.forecasting.intervals import horizon_conformal_bands
 from demandiq.forecasting.ml_models import LGBMForecaster
 from demandiq.forecasting.statistical_models import ETSForecaster
 
 logger = logging.getLogger(__name__)
 
-FORECASTER_MAP = {
-    "naive": lambda: NaiveForecaster(),
-    "seasonal_naive": lambda: SeasonalNaiveForecaster(period=7),
-    "ets": lambda: ETSForecaster(seasonal_period=7),
-    "lgbm": lambda h: LGBMForecaster(horizon=h),
+MODEL_LABELS: dict[str, str] = {
+    "naive": "Naive",
+    "seasonal_naive": "Seasonal naive",
+    "ets": "ETS (Holt-Winters)",
+    "lgbm": "LightGBM",
 }
+AVAILABLE_MODELS = list(MODEL_LABELS)
 
 
-def _get_forecaster(model_name: str, horizon: int):
-    """Instantiate the correct forecaster by name."""
+def get_forecaster(model_name: str, horizon: int):
+    """Instantiate a forecaster by name."""
     if model_name == "lgbm":
         return LGBMForecaster(horizon=horizon)
-    elif model_name == "ets":
+    if model_name == "ets":
         return ETSForecaster(seasonal_period=7)
-    elif model_name == "seasonal_naive":
+    if model_name == "seasonal_naive":
         return SeasonalNaiveForecaster(period=7)
-    elif model_name == "naive":
+    if model_name == "naive":
         return NaiveForecaster()
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    raise ValueError(f"Unknown model: {model_name}")
+
+
+@dataclass
+class ModelResult:
+    """Everything produced for one model on one series."""
+
+    model_name: str
+    backtest: BacktestSummary
+    metrics: dict[str, float]
+    future: pd.DataFrame
+    feature_importance: pd.DataFrame | None = None
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def label(self) -> str:
+        return MODEL_LABELS.get(self.model_name, self.model_name)
+
+
+def prepare_series_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise a sales frame to [date, units_sold, onpromotion, is_holiday], sorted."""
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    out = out.sort_values("date").reset_index(drop=True)
+    for col in ("onpromotion", "is_holiday"):
+        out[col] = out[col].astype(int) if col in out.columns else 0
+    out["units_sold"] = out["units_sold"].astype(float)
+    return out[["date", "units_sold", "onpromotion", "is_holiday"]]
+
+
+def future_intervals(point: np.ndarray, backtest: BacktestSummary, levels: list[float]) -> dict[str, np.ndarray]:
+    """Calibrate future intervals on every backtest fold (all fully observed)."""
+    residuals = backtest.residual_matrix()
+    if residuals.size == 0:
+        return {"point": np.maximum(np.asarray(point, float), 0.0)}
+    return horizon_conformal_bands(
+        point, residuals, levels, calibration_predictions=backtest.prediction_matrix()
+    )
+
+
+def forecast_series(
+    df: pd.DataFrame,
+    model_names: list[str] | None = None,
+    horizon: int | None = None,
+    n_splits: int | None = None,
+    promo_plan: pd.DataFrame | None = None,
+) -> dict[str, ModelResult]:
+    """
+    Backtest and forecast one store-product series with each model.
+
+    Parameters
+    ----------
+    df : Sales frame for one series with [date, units_sold] and optionally
+        [onpromotion, is_holiday].
+    promo_plan : Optional frame with `onpromotion` for the future days, used
+        by models that understand promotions (LightGBM).
+    """
+    model_names = model_names or settings.ENABLED_MODELS
+    horizon = horizon or settings.DEFAULT_HORIZON
+    n_splits = n_splits or settings.BACKTEST_SPLITS
+
+    frame = prepare_series_frame(df)
+    series = frame.set_index("date")["units_sold"]
+    if len(series) < settings.MIN_TRAIN_PERIODS + horizon:
+        raise ValueError(
+            f"Need at least {settings.MIN_TRAIN_PERIODS + horizon} days of history, got {len(series)}."
+        )
+
+    last_date = series.index.max()
+    future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=horizon, freq="D")
+    exog = future_calendar(last_date, horizon)
+    if promo_plan is not None and "onpromotion" in promo_plan.columns:
+        exog["onpromotion"] = promo_plan["onpromotion"].astype(int).to_numpy()[:horizon]
+
+    results: dict[str, ModelResult] = {}
+    for name in model_names:
+        if name not in MODEL_LABELS:
+            logger.warning("Unknown model '%s'. Skipping.", name)
+            continue
+
+        backtest = rolling_origin_backtest(
+            series=series,
+            forecaster_factory=lambda name=name: get_forecaster(name, horizon),
+            horizon=horizon,
+            n_splits=n_splits,
+            min_train_size=settings.MIN_TRAIN_PERIODS,
+            step_size=7,
+            series_df=frame,
+            levels=settings.PI_LEVELS,
+        )
+
+        model = get_forecaster(name, horizon)
+        if getattr(model, "requires_frame", False):
+            model.fit(frame)
+            point = model.predict(horizon, future_exog=exog)
+        else:
+            model.fit(series)
+            point = model.predict(horizon)
+
+        bands = future_intervals(point, backtest, settings.PI_LEVELS)
+        future = pd.DataFrame({"date": future_dates, "point_forecast": bands["point"]})
+        for key in ("lower_80", "upper_80", "lower_95", "upper_95"):
+            future[key] = bands.get(key)
+
+        importance = model.feature_importance() if hasattr(model, "feature_importance") else None
+        results[name] = ModelResult(
+            model_name=name,
+            backtest=backtest,
+            metrics=backtest.mean_metrics,
+            future=future,
+            feature_importance=importance,
+        )
+    return results
+
+
+def best_model(results: dict[str, ModelResult], metric: str = "WAPE") -> str | None:
+    """Name of the model with the lowest backtest `metric`."""
+    scored = {
+        name: r.metrics.get(metric, np.nan)
+        for name, r in results.items()
+        if np.isfinite(r.metrics.get(metric, np.nan))
+    }
+    return min(scored, key=scored.get) if scored else None
+
+
+def _none_if_nan(value) -> float | None:
+    return None if value is None or not np.isfinite(value) else float(value)
+
+
+def save_model_result(store_id: str, product_id: str, result: ModelResult, horizon: int, n_splits: int) -> int:
+    """
+    Save one model's run and future forecasts, replacing an identical earlier
+    run (same series, model, training cutoff and horizon) so re-running the
+    pipeline does not create duplicates.
+    """
+    training_cutoff = (result.future["date"].min() - pd.Timedelta(days=1)).date()
+    metrics = result.metrics
+
+    with get_db() as session:
+        previous = (
+            session.query(ForecastRun)
+            .filter(
+                ForecastRun.store_id == store_id,
+                ForecastRun.product_id == product_id,
+                ForecastRun.model_name == result.model_name,
+                ForecastRun.training_cutoff == training_cutoff,
+                ForecastRun.horizon_days == horizon,
+            )
+            .all()
+        )
+        for run in previous:
+            session.query(ReplenishmentRecommendation).filter(
+                ReplenishmentRecommendation.forecast_run_id == run.forecast_run_id
+            ).delete()
+            session.query(Forecast).filter(Forecast.forecast_run_id == run.forecast_run_id).delete()
+            session.delete(run)
+        session.flush()
+
+        run = ForecastRun(
+            model_name=result.model_name,
+            training_cutoff=training_cutoff,
+            horizon_days=horizon,
+            store_id=store_id,
+            product_id=product_id,
+            model_config=json.dumps({
+                "horizon": horizon,
+                "n_backtest_splits": n_splits,
+                "folds_evaluated": result.backtest.n_folds,
+                "intervals": "horizon-aware conformal (rolling-origin residuals)",
+            }),
+            eval_mae=_none_if_nan(metrics.get("MAE")),
+            eval_rmse=_none_if_nan(metrics.get("RMSE")),
+            eval_wape=_none_if_nan(metrics.get("WAPE")),
+            eval_mase=_none_if_nan(metrics.get("MASE")),
+            eval_coverage_80=_none_if_nan(metrics.get("Coverage_80")),
+            eval_coverage_95=_none_if_nan(metrics.get("Coverage_95")),
+        )
+        session.add(run)
+        session.flush()
+
+        for row in result.future.itertuples(index=False):
+            session.add(Forecast(
+                forecast_run_id=run.forecast_run_id,
+                forecast_date=row.date.date(),
+                store_id=store_id,
+                product_id=product_id,
+                point_forecast=float(row.point_forecast),
+                lower_80=_none_if_nan(row.lower_80),
+                upper_80=_none_if_nan(row.upper_80),
+                lower_95=_none_if_nan(row.lower_95),
+                upper_95=_none_if_nan(row.upper_95),
+                is_future=True,
+            ))
+        return run.forecast_run_id
 
 
 def run_forecast_pipeline(
@@ -61,219 +251,39 @@ def run_forecast_pipeline(
     model_names: list[str] | None = None,
     horizon: int | None = None,
     n_backtest_splits: int | None = None,
-    force_retrain: bool = False,
 ) -> dict[str, dict]:
     """
-    Full pipeline for one store-product series:
-        1. Load data from DB
-        2. Run rolling-origin backtest for each model
-        3. Generate future forecasts
-        4. Store forecast runs and forecasts in DB
-        5. Return summary dict per model
-
-    Parameters
-    ----------
-    store_id, product_id : Series identifiers.
-    model_names : List of model names to train. Default: settings.ENABLED_MODELS.
-    horizon : Forecast horizon in days. Default: settings.DEFAULT_HORIZON.
-    n_backtest_splits : Number of backtest folds. Default: settings.BACKTEST_SPLITS.
-    force_retrain : If True, retrain even if a recent run exists.
-
-    Returns
-    -------
-    Dict mapping model_name → {run_id, backtest_summary, future_forecast_df, metrics}
+    Load one series from the database, forecast it with each model, and save
+    the runs. Returns {model_name: {run_id, metrics, future_forecast_df,
+    backtest_summary, model_name}} or {model_name: {"error": ...}}.
     """
-    model_names = model_names or settings.ENABLED_MODELS
     horizon = horizon or settings.DEFAULT_HORIZON
     n_splits = n_backtest_splits or settings.BACKTEST_SPLITS
 
     with get_db() as session:
         df = get_sales_dataframe(session, store_id=store_id, product_id=product_id)
-
     if df.empty:
         logger.warning("No data found for store=%s product=%s", store_id, product_id)
         return {}
 
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    series = df.set_index("date")["units_sold"]
-
-    if len(series) < settings.MIN_TRAIN_PERIODS:
-        logger.warning(
-            "Insufficient data for %s/%s: %d rows (need %d). Skipping.",
-            store_id, product_id, len(series), settings.MIN_TRAIN_PERIODS,
-        )
+    try:
+        results = forecast_series(df, model_names, horizon, n_splits)
+    except ValueError as exc:
+        logger.warning("Skipping %s/%s: %s", store_id, product_id, exc)
         return {}
 
-    results = {}
-
-    for model_name in model_names:
-        if model_name not in FORECASTER_MAP and model_name != "lgbm":
-            logger.warning("Unknown model '%s'. Skipping.", model_name)
-            continue
-
+    output: dict[str, dict] = {}
+    for name, result in results.items():
         try:
-            results[model_name] = _train_and_forecast_model(
-                model_name=model_name,
-                series=series,
-                df=df,
-                store_id=store_id,
-                product_id=product_id,
-                horizon=horizon,
-                n_splits=n_splits,
-            )
-        except Exception as exc:
-            logger.error("Pipeline failed for model=%s, store=%s, product=%s: %s",
-                         model_name, store_id, product_id, exc, exc_info=True)
-            results[model_name] = {"error": str(exc)}
-
-    return results
-
-
-def _train_and_forecast_model(
-    model_name: str,
-    series: pd.Series,
-    df: pd.DataFrame,
-    store_id: str,
-    product_id: str,
-    horizon: int,
-    n_splits: int,
-) -> dict:
-    """Train one model, run backtest, generate future forecast, save to DB."""
-    logger.info("Training %s for %s/%s (horizon=%d)", model_name, store_id, product_id, horizon)
-
-    # --- Backtest ---
-    def factory():
-        return _get_forecaster(model_name, horizon)
-
-    series_df = df if model_name == "lgbm" else None
-
-    backtest = rolling_origin_backtest(
-        series=series,
-        forecaster_factory=factory,
-        horizon=horizon,
-        n_splits=n_splits,
-        min_train_size=settings.MIN_TRAIN_PERIODS,
-        series_df=series_df,
-    )
-
-    mean_metrics = backtest.mean_metrics
-
-    # --- Future forecast ---
-    future_forecaster = _get_forecaster(model_name, horizon)
-
-    if model_name == "lgbm":
-        future_forecaster.fit(df)
-        future_result = _prediction_intervals_from_backtest(
-            point=future_forecaster.predict(horizon),
-            backtest=backtest,
-            levels=settings.PI_LEVELS,
-        )
-    else:
-        future_forecaster.fit(series)
-        # Wrap with conformal prediction. This expects simple series-based
-        # forecasters; ML models that need a full feature frame are handled above.
-        conformal = ConformalIntervalWrapper(future_forecaster, calibration_frac=0.2)
-        conformal.fit(series)
-        future_result = conformal.predict_with_intervals(horizon, levels=settings.PI_LEVELS)
-
-    future_point = future_result["point"]
-
-    # Generate future dates
-    last_date = series.index.max()
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=horizon, freq="D")
-
-    # --- Save to DB ---
-    training_cutoff = last_date.date()
-
-    with get_db() as session:
-        run = ForecastRun(
-            model_name=model_name,
-            training_cutoff=training_cutoff,
-            horizon_days=horizon,
-            store_id=store_id,
-            product_id=product_id,
-            model_config=json.dumps({"horizon": horizon, "n_backtest_splits": n_splits}),
-            eval_mae=mean_metrics.get("MAE"),
-            eval_rmse=mean_metrics.get("RMSE"),
-            eval_wape=mean_metrics.get("WAPE"),
-            eval_mase=mean_metrics.get("MASE"),
-            eval_coverage_80=mean_metrics.get("Coverage_80"),
-            eval_coverage_95=mean_metrics.get("Coverage_95"),
-        )
-        session.add(run)
-        session.flush()  # Get run_id
-
-        # Save future forecasts
-        for i, fdate in enumerate(future_dates):
-            fc = Forecast(
-                forecast_run_id=run.forecast_run_id,
-                forecast_date=fdate.date(),
-                store_id=store_id,
-                product_id=product_id,
-                point_forecast=max(float(future_point[i]), 0.0),
-                lower_80=float(future_result.get("lower_80", [None] * horizon)[i]) if "lower_80" in future_result else None,
-                upper_80=float(future_result.get("upper_80", [None] * horizon)[i]) if "upper_80" in future_result else None,
-                lower_95=float(future_result.get("lower_95", [None] * horizon)[i]) if "lower_95" in future_result else None,
-                upper_95=float(future_result.get("upper_95", [None] * horizon)[i]) if "upper_95" in future_result else None,
-                is_future=True,
-            )
-            session.add(fc)
-
-        run_id = run.forecast_run_id
-
-    # Build future forecast DataFrame for return
-    future_df = pd.DataFrame({
-        "date": future_dates,
-        "point_forecast": np.maximum(future_point, 0.0),
-        "lower_80": future_result.get("lower_80"),
-        "upper_80": future_result.get("upper_80"),
-        "lower_95": future_result.get("lower_95"),
-        "upper_95": future_result.get("upper_95"),
-    })
-
-    logger.info(
-        "Model %s: MAE=%.2f, RMSE=%.2f, WAPE=%.3f",
-        model_name, mean_metrics.get("MAE", 0), mean_metrics.get("RMSE", 0), mean_metrics.get("WAPE", 0),
-    )
-
-    return {
-        "run_id": run_id,
-        "backtest_summary": backtest,
-        "future_forecast_df": future_df,
-        "metrics": mean_metrics,
-        "model_name": model_name,
-    }
-
-
-def _prediction_intervals_from_backtest(
-    point: np.ndarray,
-    backtest,
-    levels: list[float],
-) -> dict[str, np.ndarray]:
-    """
-    Build simple residual-quantile prediction intervals from temporal backtests.
-
-    The residuals come only from historical validation folds whose training
-    windows precede their validation windows. This is not a full conditional
-    conformal method, but it avoids future leakage and gives ML forecasts a
-    transparent uncertainty estimate until a richer calibration wrapper exists.
-    """
-    point = np.maximum(np.asarray(point, dtype=float), 0.0)
-    result: dict[str, np.ndarray] = {"point": point}
-
-    residuals = []
-    for fold in backtest.folds:
-        residuals.extend(np.asarray(fold.actual, dtype=float) - np.asarray(fold.predicted, dtype=float))
-
-    if not residuals:
-        return result
-
-    abs_residuals = np.abs(np.asarray(residuals, dtype=float))
-    for level in levels:
-        q = float(np.quantile(abs_residuals, level))
-        label = f"{int(level * 100)}"
-        result[f"lower_{label}"] = np.maximum(point - q, 0.0)
-        result[f"upper_{label}"] = point + q
-
-    return result
+            run_id = save_model_result(store_id, product_id, result, horizon, n_splits)
+            output[name] = {
+                "run_id": run_id,
+                "model_name": name,
+                "metrics": result.metrics,
+                "future_forecast_df": result.future,
+                "backtest_summary": result.backtest,
+            }
+        except Exception as exc:  # keep other models going
+            logger.error("Saving %s for %s/%s failed: %s", name, store_id, product_id, exc, exc_info=True)
+            output[name] = {"error": str(exc)}
+    return output

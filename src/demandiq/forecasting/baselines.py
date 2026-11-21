@@ -139,7 +139,6 @@ class SeasonalNaiveForecaster:
         if residuals is not None and len(residuals) > 0:
             std_residual = float(np.std(residuals, ddof=1))
             for level in levels:
-                alpha = 1.0 - level
                 z = 1.96 if level == 0.95 else 1.28  # approximations
                 label = f"{int(level * 100)}"
                 result[f"lower_{label}"] = np.maximum(point - z * std_residual, 0.0)

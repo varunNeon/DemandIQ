@@ -12,7 +12,6 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from demandiq.database.models import (
